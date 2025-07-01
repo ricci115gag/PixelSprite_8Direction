@@ -1,0 +1,18 @@
+# 模型参数
+model:
+  in_channels: 4        # 输入通道数(RGBA)
+  base_channels: 32     # 基础通道数
+  embed_dim: 128        # 角度嵌入维度
+
+# 训练参数
+train:
+  batch_size: 32     # 批量大小
+  epochs: 200        # 训练轮数
+  lr: 0.0001            # 学习率
+  h: 48                 # 图像高度
+  w: 32                 # 图像宽度
+  dataset_path: "D:/资料/project/AI_Project/PixelSprite_8Direction/TrainningData/Octopath"  # 训练集路径
+
+# 其他参数
+misc:
+  model_path: "./models/2nd_try"  # 模型保存路径
