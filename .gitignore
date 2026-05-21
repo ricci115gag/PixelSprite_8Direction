@@ -1,0 +1,61 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Upstream LPC checkout. Keep this local-only; it contains a huge sprite corpus
+# and its own nested Git metadata/config.
+/Universal-LPC-Spritesheet-Character-Generator/
+
+# LPC bulk asset/data directories, in case they are copied outside the upstream checkout.
+/**/spritesheets/
+/**/sources/
+/**/sheet_definitions/
+/**/palette_definitions/
+/**/readme-images/
+
+# Generated datasets and previews
+/dataset_lpc_v*/
+/datasets/
+/data/
+/outputs/
+/generated/
+/runs/
+/logs/
+/tmp/
+/reports/
+/reports/bad_samples/
+/reports/sample_contact_sheet*.png
+/reports/sheet_grid_preview*.png
+
+# Existing local training/model artifacts
+/TrainningData/
+/PaperAssets/
+/models/
+/prediction_result*.png
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# Experiment trackers and training caches
+/wandb/
+/lightning_logs/
+/tensorboard/
+/checkpoints/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
