@@ -11,7 +11,7 @@ import torch.optim as optim
 from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm import tqdm
@@ -19,21 +19,26 @@ from tqdm import tqdm
 from pixel_sprite.config import load_config, resolve_project_path
 from pixel_sprite.controller.split import split_dataset_by_character, subset_character_ids
 from pixel_sprite.model.dataset import DirectionPairDataset
-from pixel_sprite.model.discriminator import Discriminator
-from pixel_sprite.model.generator import UNetGenerator
+from pixel_sprite.model.factory import get_model_class
 
 
-def train_model(config_path: str | Path = "config.yaml") -> None:
+def train_model(config_path: str | Path = "config.yaml", version: int = 2) -> None:
     config = load_config(config_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    tb_port = config["misc"].get("tb_port", 6006)
+    _start_tensorboard_if_needed(tb_port)
 
-    model_g = UNetGenerator(
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device} | Model version: {version}")
+
+    GeneratorClass = get_model_class(version, "generator")
+    DiscriminatorClass = get_model_class(version, "discriminator")
+
+    model_g = GeneratorClass(
         in_channels=config["model"].get("in_channels", 4),
         base_channels=config["model"].get("base_channels", 32),
     ).to(device)
 
-    model_d = Discriminator(
+    model_d = DiscriminatorClass(
         in_channels=config["model"].get("in_channels", 4) * 2,  # 8 channels
         base_channels=config["model"].get("base_channels", 32),
     ).to(device)
@@ -71,20 +76,6 @@ def train_model(config_path: str | Path = "config.yaml") -> None:
         f"{len(splits['val'])} pairs"
     )
 
-    checkpoints_dir = resolve_project_path(config["misc"].get("checkpoints_path", "./checkpoints"))
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    csv_file = checkpoints_dir / "loss.csv"
-
-    start_epoch, global_step, train_g_losses, train_d_losses, val_g_losses = _load_checkpoint(
-        model_g, model_d, checkpoints_dir, csv_file, device
-    )
-
-    tb_log_dir = resolve_project_path("runs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
-    writer = SummaryWriter(log_dir=str(tb_log_dir))
-
-    criterion_recon = nn.L1Loss().to(device)
-    criterion_gan = nn.BCELoss().to(device)
-
     lr_g = config["train"].get("lr_g", config["train"].get("lr", 0.0002))
     lr_d = config["train"].get("lr_d", config["train"].get("lr", 0.0002))
     lambda_adv = config["train"].get("lambda_adv", 0.01)
@@ -94,10 +85,32 @@ def train_model(config_path: str | Path = "config.yaml") -> None:
     optimizer_g = optim.Adam(model_g.parameters(), lr=lr_g, betas=(0.5, 0.999))
     optimizer_d = optim.Adam(model_d.parameters(), lr=lr_d, betas=(0.5, 0.999))
 
+    checkpoints_base = resolve_project_path(config["misc"].get("checkpoints_path", "./checkpoints"))
+    checkpoints_dir = checkpoints_base / f"v{version}"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    csv_file = checkpoints_dir / "loss.csv"
+
+    start_epoch, global_step, train_g_losses, train_d_losses, val_g_losses = _load_checkpoint(
+        model_g, model_d, optimizer_g, optimizer_d, checkpoints_dir, csv_file, device
+    )
+
+    # Ensure learning rates are set from configuration (even if loaded state dict overwrote them)
+    for param_group in optimizer_g.param_groups:
+        param_group['lr'] = lr_g
+    for param_group in optimizer_d.param_groups:
+        param_group['lr'] = lr_d
+
+    tb_log_dir = resolve_project_path("runs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    writer = SummaryWriter(log_dir=str(tb_log_dir))
+
+    criterion_recon = nn.L1Loss().to(device)
+    criterion_gan = nn.BCELoss().to(device)
+
     end_epoch = start_epoch + config["train"]["epochs"]
     sample_every = config["train"].get("sample_every", 10)
 
     last_img_time = 0.0
+    last_backup_time = time.time()
 
     try:
         for epoch in range(start_epoch, end_epoch):
@@ -131,28 +144,39 @@ def train_model(config_path: str | Path = "config.yaml") -> None:
                 f"loss_g: {train_loss_g:.6f}, loss_d: {train_loss_d:.6f}, val_loss_g: {val_loss_g:.6f}"
             )
 
-            # Save epoch checkpoint safely
-            _save_checkpoint(model_g, model_d, checkpoints_dir, global_step)
-
+            # Update loss CSV
             _write_loss_csv(csv_file, train_g_losses, train_d_losses, val_g_losses)
 
+            # Save temporary backup if 30s has passed since last save
+            current_time = time.time()
+            if current_time - last_backup_time >= 30.0:
+                _save_checkpoint(model_g, model_d, optimizer_g, optimizer_d, checkpoints_dir, global_step, suffix="temp")
+                last_backup_time = current_time
+
             if sample_every and (epoch + 1) % sample_every == 0:
-                sample_loader = val_loader if len(val_loader) > 0 else train_loader
                 _save_sample_predictions(
-                    model_g, sample_loader, device, checkpoints_dir / "samples" / f"epoch_{epoch + 1:04d}.png"
+                    model_g, val_loader, device, checkpoints_dir / "samples" / f"epoch_{epoch + 1:04d}.png"
                 )
+
+        # Save final checkpoint upon successful normal completion
+        _save_checkpoint(model_g, model_d, optimizer_g, optimizer_d, checkpoints_dir, global_step)
+        _delete_temp_checkpoints(checkpoints_dir)
+
     except KeyboardInterrupt:
         print("\n[Warning] Training interrupted by user. Saving current checkpoint safely...")
-        _save_checkpoint(model_g, model_d, checkpoints_dir, global_step)
+        _save_checkpoint(model_g, model_d, optimizer_g, optimizer_d, checkpoints_dir, global_step)
         _write_loss_csv(csv_file, train_g_losses, train_d_losses, val_g_losses)
+        _delete_temp_checkpoints(checkpoints_dir)
         print("Progress saved successfully. Exiting.")
     finally:
         writer.close()
 
 
 def _load_checkpoint(
-    model_g: UNetGenerator,
-    model_d: Discriminator,
+    model_g: nn.Module,
+    model_d: nn.Module,
+    optimizer_g: optim.Optimizer,
+    optimizer_d: optim.Optimizer,
     checkpoints_dir: Path,
     csv_file: Path,
     device: torch.device,
@@ -161,16 +185,28 @@ def _load_checkpoint(
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
         return 0, 0, [], [], []
 
-    gen_files = list(checkpoints_dir.glob("generator_*.safetensors"))
-    if not gen_files:
-        return 0, 0, [], [], []
+    # 1. Try to load from temp files first (e.g. if training was interrupted/crashed)
+    temp_gen = checkpoints_dir / "generator_temp.safetensors"
+    if temp_gen.exists():
+        latest_gen = temp_gen
+        corresponding_d = checkpoints_dir / "discriminator_temp.safetensors"
+        corresponding_opt_g = checkpoints_dir / "optimizer_g_temp.pt"
+        corresponding_opt_d = checkpoints_dir / "optimizer_d_temp.pt"
+        print("Found temporary checkpoint to resume training.")
+    else:
+        # 2. Fall back to latest timestamped checkpoints (excluding generator_temp.safetensors)
+        gen_files = [f for f in checkpoints_dir.glob("generator_*.safetensors") if f.name != "generator_temp.safetensors"]
+        if not gen_files:
+            return 0, 0, [], [], []
 
-    # Sort checkpoints by filename reverse (newest timestamp first)
-    gen_files.sort(key=lambda x: x.name, reverse=True)
-    latest_gen = gen_files[0]
-    
-    timestamp = latest_gen.name.replace("generator_", "").replace(".safetensors", "")
-    corresponding_d = checkpoints_dir / f"discriminator_{timestamp}.safetensors"
+        # Sort checkpoints by filename reverse (newest timestamp first)
+        gen_files.sort(key=lambda x: x.name, reverse=True)
+        latest_gen = gen_files[0]
+        
+        timestamp = latest_gen.name.replace("generator_", "").replace(".safetensors", "")
+        corresponding_d = checkpoints_dir / f"discriminator_{timestamp}.safetensors"
+        corresponding_opt_g = checkpoints_dir / f"optimizer_g_{timestamp}.pt"
+        corresponding_opt_d = checkpoints_dir / f"optimizer_d_{timestamp}.pt"
 
     global_step = 0
     try:
@@ -196,6 +232,22 @@ def _load_checkpoint(
     else:
         print(f"No corresponding Discriminator checkpoint found at {corresponding_d}")
 
+    if corresponding_opt_g.exists():
+        try:
+            state_dict_opt_g = torch.load(corresponding_opt_g, map_location=device)
+            optimizer_g.load_state_dict(state_dict_opt_g)
+            print(f"Loaded Generator Optimizer state from {corresponding_opt_g}")
+        except Exception as e:
+            print(f"Error loading Generator Optimizer state: {e}")
+
+    if corresponding_opt_d.exists():
+        try:
+            state_dict_opt_d = torch.load(corresponding_opt_d, map_location=device)
+            optimizer_d.load_state_dict(state_dict_opt_d)
+            print(f"Loaded Discriminator Optimizer state from {corresponding_opt_d}")
+        except Exception as e:
+            print(f"Error loading Discriminator Optimizer state: {e}")
+
     if not csv_file.exists():
         return 0, global_step, [], [], []
 
@@ -215,8 +267,8 @@ def _load_checkpoint(
 
 
 def _train_epoch(
-    model_g: UNetGenerator,
-    model_d: Discriminator,
+    model_g: nn.Module,
+    model_d: nn.Module,
     dataloader: DataLoader,
     criterion_recon: nn.Module,
     criterion_gan: nn.Module,
@@ -230,7 +282,7 @@ def _train_epoch(
     end_epoch: int,
     writer: SummaryWriter,
     global_step: int,
-    val_loader: DataLoader,
+    preview_dataset: Dataset | DataLoader,
     last_img_time: float,
 ) -> tuple[float, float, int, float]:
     model_g.train()
@@ -254,13 +306,13 @@ def _train_epoch(
         # Real pair: D(source, target)
         real_pair = torch.cat([source_images, target_images], dim=1)
         pred_real, feat_real = model_d(real_pair)
-        loss_d_real = criterion_gan(pred_real, torch.ones(b_size, 1, device=device))
+        loss_d_real = criterion_gan(pred_real, torch.ones_like(pred_real))
 
         # Fake pair: D(source, G(source))
         fake_targets = model_g(source_images)
         fake_pair = torch.cat([source_images, fake_targets.detach()], dim=1)
         pred_fake, _ = model_d(fake_pair)
-        loss_d_fake = criterion_gan(pred_fake, torch.zeros(b_size, 1, device=device))
+        loss_d_fake = criterion_gan(pred_fake, torch.zeros_like(pred_fake))
 
         # Real/Fake output discriminator loss
         loss_d = (loss_d_real + loss_d_fake) / 2
@@ -278,7 +330,7 @@ def _train_epoch(
         # Adversarial loss: G wants D to think fake_pair is Real
         fake_pair_for_g = torch.cat([source_images, fake_targets], dim=1)
         pred_fake_g, feat_fake = model_d(fake_pair_for_g)
-        loss_g_gan = criterion_gan(pred_fake_g, torch.ones(b_size, 1, device=device))
+        loss_g_gan = criterion_gan(pred_fake_g, torch.ones_like(pred_fake_g))
 
         # Feature Matching Loss
         loss_fm = sum(torch.mean(torch.abs(f_r.detach() - f_f)) for f_r, f_f in zip(feat_real, feat_fake))
@@ -300,7 +352,7 @@ def _train_epoch(
 
         # Log prediction image to TensorBoard every 5 seconds
         if time.time() - last_img_time >= 5.0:
-            _log_sample_predictions_to_tb(model_g, val_loader, device, writer, global_step)
+            _log_sample_predictions_to_tb(model_g, preview_dataset, device, writer, global_step)
             last_img_time = time.time()
 
         progress.set_postfix(
@@ -319,7 +371,7 @@ def _train_epoch(
 
 
 def _validate(
-    model_g: UNetGenerator,
+    model_g: nn.Module,
     dataloader: DataLoader,
     criterion_recon: nn.Module,
     device: torch.device,
@@ -356,18 +408,31 @@ def _write_loss_csv(
 
 
 def _save_sample_predictions(
-    model: UNetGenerator,
-    dataloader: DataLoader,
+    model: nn.Module,
+    dataset_or_loader: Dataset | DataLoader,
     device: torch.device,
     output_path: Path,
-    max_samples: int = 4,
+    max_samples: int = 1,
 ) -> None:
-    if len(dataloader) == 0:
+    if dataset_or_loader is None:
         return
     model.eval()
-    batch = next(iter(dataloader))
-    source_images = batch["source_image"][:max_samples].to(device)
-    target_images = batch["target_image"][:max_samples].to(device)
+    
+    if hasattr(dataset_or_loader, "dataset"):
+        dataset = dataset_or_loader.dataset
+    else:
+        dataset = dataset_or_loader
+        
+    if len(dataset) == 0:
+        return
+    
+    import random
+    indices = random.sample(range(len(dataset)), min(max_samples, len(dataset)))
+    samples = [dataset[i] for i in indices]
+    
+    source_images = torch.stack([s["source_image"] for s in samples]).to(device)
+    target_images = torch.stack([s["target_image"] for s in samples]).to(device)
+    
     with torch.no_grad():
         predictions = model(source_images)
     rows = [
@@ -377,7 +442,9 @@ def _save_sample_predictions(
         for source, pred, target in zip(source_images, predictions, target_images)
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _concat_images(rows, vertical=True).save(output_path)
+    full_img = _concat_images(rows, vertical=True)
+    w, h = full_img.size
+    full_img.resize((w * 4, h * 4), Image.NEAREST).save(output_path)
 
 
 def _tensor_to_rgba(tensor: torch.Tensor) -> Image.Image:
@@ -408,23 +475,34 @@ def _concat_images(images: list[Image.Image], vertical: bool = False) -> Image.I
 
 
 def _save_checkpoint(
-    model_g: UNetGenerator,
-    model_d: Discriminator,
+    model_g: nn.Module,
+    model_d: nn.Module,
+    optimizer_g: optim.Optimizer,
+    optimizer_d: optim.Optimizer,
     checkpoints_dir: Path,
     global_step: int,
+    suffix: str | None = None,
 ) -> tuple[Path, Path]:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    gen_file = checkpoints_dir / f"generator_{timestamp}.safetensors"
-    disc_file = checkpoints_dir / f"discriminator_{timestamp}.safetensors"
+    if suffix:
+        tag = suffix
+    else:
+        tag = time.strftime("%Y%m%d_%H%M%S")
+
+    gen_file = checkpoints_dir / f"generator_{tag}.safetensors"
+    disc_file = checkpoints_dir / f"discriminator_{tag}.safetensors"
+    opt_g_file = checkpoints_dir / f"optimizer_g_{tag}.pt"
+    opt_d_file = checkpoints_dir / f"optimizer_d_{tag}.pt"
 
     metadata = {
         "global_step": str(global_step),
-        "timestamp": timestamp,
+        "tag": tag,
     }
 
     # Temporary files for write safety (Write-then-replace)
     tmp_gen = gen_file.with_suffix(".tmp")
     tmp_disc = disc_file.with_suffix(".tmp")
+    tmp_opt_g = opt_g_file.with_suffix(".tmp")
+    tmp_opt_d = opt_d_file.with_suffix(".tmp")
 
     try:
         # Save Generator (ensure contiguous tensors for safetensors saving)
@@ -439,36 +517,77 @@ def _save_checkpoint(
         if tmp_disc.exists():
             tmp_disc.replace(disc_file)
 
-        print(f"\n[Info] Saved checkpoint safely:")
+        # Save Optimizers
+        torch.save(optimizer_g.state_dict(), tmp_opt_g)
+        if tmp_opt_g.exists():
+            tmp_opt_g.replace(opt_g_file)
+
+        torch.save(optimizer_d.state_dict(), tmp_opt_d)
+        if tmp_opt_d.exists():
+            tmp_opt_d.replace(opt_d_file)
+
+        print(f"\n[Info] Saved checkpoint safely ({tag}):")
         print(f"  Generator: {gen_file}")
         print(f"  Discriminator: {disc_file}")
+        print(f"  Generator Optimizer: {opt_g_file}")
+        print(f"  Discriminator Optimizer: {opt_d_file}")
     except Exception as e:
         print(f"Error saving checkpoint safely: {e}")
-        if tmp_gen.exists():
-            tmp_gen.unlink()
-        if tmp_disc.exists():
-            tmp_disc.unlink()
+        for tmp_f in [tmp_gen, tmp_disc, tmp_opt_g, tmp_opt_d]:
+            if tmp_f.exists():
+                tmp_f.unlink()
 
     return gen_file, disc_file
 
 
+def _delete_temp_checkpoints(checkpoints_dir: Path) -> None:
+    temp_files = [
+        checkpoints_dir / "generator_temp.safetensors",
+        checkpoints_dir / "discriminator_temp.safetensors",
+        checkpoints_dir / "optimizer_g_temp.pt",
+        checkpoints_dir / "optimizer_d_temp.pt",
+        checkpoints_dir / "generator_temp.tmp",
+        checkpoints_dir / "discriminator_temp.tmp",
+        checkpoints_dir / "optimizer_g_temp.tmp",
+        checkpoints_dir / "optimizer_d_temp.tmp",
+    ]
+    for f in temp_files:
+        if f.exists():
+            try:
+                f.unlink()
+                print(f"Deleted temporary checkpoint file: {f.name}")
+            except Exception as e:
+                print(f"Error deleting temporary checkpoint file {f.name}: {e}")
+
+
 def _log_sample_predictions_to_tb(
-    model: UNetGenerator,
-    dataloader: DataLoader,
+    model: nn.Module,
+    dataset_or_loader: Dataset | DataLoader,
     device: torch.device,
     writer: SummaryWriter,
     global_step: int,
-    max_samples: int = 4,
+    max_samples: int = 1,
 ) -> None:
-    if len(dataloader) == 0:
+    if dataset_or_loader is None:
         return
     model.eval()
-    try:
-        batch = next(iter(dataloader))
-    except StopIteration:
+    
+    if hasattr(dataset_or_loader, "dataset"):
+        dataset = dataset_or_loader.dataset
+    else:
+        dataset = dataset_or_loader
+        
+    if len(dataset) == 0:
         return
-    source_images = batch["source_image"][:max_samples].to(device)
-    target_images = batch["target_image"][:max_samples].to(device)
+    
+    import random
+    
+    indices = random.sample(range(len(dataset)), min(max_samples, len(dataset)))
+    batch_samples = [dataset[i] for i in indices]
+    
+    source_images = torch.stack([s["source_image"] for s in batch_samples]).to(device)
+    target_images = torch.stack([s["target_image"] for s in batch_samples]).to(device)
+    
     with torch.no_grad():
         predictions = model(source_images)
     rows = [
@@ -478,10 +597,90 @@ def _log_sample_predictions_to_tb(
         for source, pred, target in zip(source_images, predictions, target_images)
     ]
     full_img = _concat_images(rows, vertical=True)
+    w, h = full_img.size
+    full_img_large = full_img.resize((w * 4, h * 4), Image.NEAREST)
     # Convert PIL Image to Tensor (C, H, W)
-    arr = np.array(full_img)
+    arr = np.array(full_img_large)
     arr_tensor = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0  # shape: (4, H, W)
     
     # Write to Tensorboard under Tag "Generated_Image"
     writer.add_image("Generated_Image", arr_tensor, global_step)
     model.train()
+
+
+def _start_tensorboard_if_needed(tb_port: int) -> None:
+    import socket
+    import sys
+    import subprocess
+
+    # Check if port is in use (robust check covering IPv4, IPv6, and localhost resolution)
+    in_use = False
+
+    # 1. Try IPv4 loopback
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(("127.0.0.1", tb_port)) == 0:
+                in_use = True
+    except Exception:
+        pass
+
+    # 2. Try IPv6 loopback
+    if not in_use:
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("::1", tb_port)) == 0:
+                    in_use = True
+        except Exception:
+            pass
+
+    # 3. Try generic localhost resolved addresses
+    if not in_use:
+        try:
+            for res in socket.getaddrinfo("localhost", tb_port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+                af, socktype, proto, canonname, sa = res
+                try:
+                    with socket.socket(af, socktype, proto) as s:
+                        s.settimeout(0.5)
+                        if s.connect_ex(sa) == 0:
+                            in_use = True
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if in_use:
+        print(f"[Info] TensorBoard is already running/accessible on port {tb_port}.")
+        return
+
+    print(f"[Info] Launching TensorBoard on port {tb_port}...")
+    log_dir = resolve_project_path("runs")
+    cmd = [
+        sys.executable,
+        "-m",
+        "tensorboard.main",
+        "--logdir",
+        str(log_dir),
+        "--port",
+        str(tb_port),
+    ]
+
+    kwargs = {}
+    if sys.platform == "win32":
+        # Use subprocess.DETACHED_PROCESS (0x00000008) to run independently
+        kwargs["creationflags"] = 0x00000008
+        kwargs["close_fds"] = True
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        log_file_path = resolve_project_path("tensorboard.log")
+        log_file = open(log_file_path, "w", encoding="utf-8")
+        kwargs["stdout"] = log_file
+        kwargs["stderr"] = log_file
+        subprocess.Popen(cmd, **kwargs)
+        print(f"[Info] TensorBoard started successfully. Open http://localhost:{tb_port}/ to view.")
+    except Exception as e:
+        print(f"[Warning] Failed to auto-start TensorBoard: {e}")

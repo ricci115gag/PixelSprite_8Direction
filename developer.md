@@ -1,5 +1,8 @@
 # PixelSprite_4Direction Developer Notes
 
+> [!CAUTION]
+> **CRITICAL AGENT CONSTRAINT**: **DO NOT RUN ANY TRAINING SCRIPTS (like `Train.py`) UNDER ANY CIRCUMSTANCES. The USER has strictly forbidden the AI agent from running model training. This rule must be strictly followed.**
+
 当前项目先用已有 Octopath 两方向素材训练一个方向迁移 baseline。LPC 仓库暂时只作为后续 4-direction 数据管线参考，不进入当前训练。
 
 ## 数据约定
@@ -27,10 +30,15 @@ TrainningData/Octopath/
 ```text
 pixel_sprite/
   model/
+    GAN/
+      discriminator.py
+      generator.py
+    GANv2/
+      discriminatorv2.py
+      generatorv2.py
     blocks.py
     dataset.py
-    discriminator.py
-    generator.py
+    factory.py
     image_ops.py
     loss.py
     network.py
@@ -47,14 +55,18 @@ pixel_sprite/
 
 ### model
 
-`model/` 放领域对象和核心算法：
+`model/` 放领域对象和核心算法，支持多模型版本管理：
 
-- `generator.py`
-  - `UNetGenerator`
-  - 标准 U-Net 结构，包含 Skip Connections 并直接输出完整的 target RGBA 图像，在 Bottleneck 处使用 Multi-Axis Attention 自注意力。
-- `discriminator.py`
-  - `Discriminator`
-  - 接受 concat(down, target) 图像输入（8 通道），经过卷积下采样和 Adaptive Average Pooling 后用 Sigmoid 预测二元分布。
+- `factory.py`
+  - 模型工厂 `get_model_class`，根据指定的 version (1 或 2) 获取对应的 Generator 或 Discriminator 类。
+- `GAN/` (v1初代模型)
+  - `generator.py` (UNetGenerator): 标准 U-Net 结构，包含 Skip Connections 并直接输出完整的 target RGBA 图像，在 Bottleneck 处使用 Multi-Axis Attention 自注意力。
+  - `discriminator.py` (Discriminator): 接受 concat(down, target) 图像输入（8 通道），经过卷积下采样和 Adaptive Average Pooling 后用 Sigmoid 预测二元分布。
+- `GANv2/` (v2改进版模型)
+  - `generatorv2.py` (UNetGenerator): v2 生成器。采用与 V1 相同的标准 U-Net 连续表征结构（去除了 Soft Palette Selector/画笔法），通过 Sigmoid 激活直接输出完整的 RGBA 图像，以维持连续的像素分布空间，确保 AI 能正常学习。
+  - `discriminatorv2.py` (Discriminator): v2 判别器。采用 **PatchGAN** 架构。
+    - **全卷积 Patch 分类**：摒弃全局池化，采用 $4$ 层 Spectral Normalization (谱归一化) 卷积层，最后一层卷积输出 $6 \times 4$ 的 Patch 局部真假判别概率网格 `[B, 1, 6, 4]`。
+    - **Patch 级别 Loss 计算**：直接将输出的 Patch 概率网格送入 BCE Loss 计算（使用 `torch.ones_like` 和 `torch.zeros_like`），确保每个局部的真假都能受到精确惩罚，避免全局均值稀释梯度。
 - `dataset.py`
   - `DirectionPairDataset`
   - 从角色目录中读取 `down/left` 图片，生成有向 source-target pairs。

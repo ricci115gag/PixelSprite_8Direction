@@ -1,5 +1,31 @@
 # PRD: Down-to-Left Pixel Sprite Direction Transfer
 
+## 0. Version Management (版本管理)
+
+本项目支持模型多版本演进及权重隔离，以支持持续的架构优化与实验对比。
+
+### GAN v1 (初代模型)
+*   **当前状态**：已完成 352 epochs 训练，模型训练已达纳什均衡。生成器对形状和动作的转向控制符合预期，但像素色块存在一定“脏色”（杂质噪点与颜色漂移）。
+*   **架构设计**：
+    *   **Generator**: 标准 U-Net 结构，包含 Skip Connections 以保留浅层细节，在 Bottleneck (16x24) 处整合横向/纵向/全局自注意力机制（Multi-Axis Attention），最终输出完整的 RGBA 图像。
+    *   **Discriminator**: 卷积下采样，引入 Spectral Normalization 稳定训练，经过 Adaptive Avg Pooling 汇聚全局特征，最终输出二元置信度。
+    *   **Losses**: L1 重建损失 + Adversarial Loss + Feature Matching Loss (0.1) + Alpha Binarization Loss (0.1)。
+*   **代码及权重归档**：
+    *   **模型定义**：[generator.py](file:///d:/data/project/PixelSprite_4Direction/pixel_sprite/model/GAN/generator.py) 与 [discriminator.py](file:///d:/data/project/PixelSprite_4Direction/pixel_sprite/model/GAN/discriminator.py)
+    *   **权重目录**：`checkpoints/v1/`
+
+### GAN v2 (迭代模型)
+*   **当前状态**：已根据训练反馈将生成器回退为 V1 的连续表征 U-Net，以恢复像素分布的连续空间并便于 AI 学习。判别器保留为 V2 的 PatchGAN。
+*   **设计方案**：
+    *   **Generator**: 标准 U-Net 连续表征结构（与 V1 结构一致，弃用尾部软色卡选择器/画笔法）。通过 Sigmoid 激活直接输出完整的 RGBA 图像，不破坏像素分布的连续空间，确保生成器平滑优化与学习。
+    *   **Discriminator**: 替换为 **PatchGAN 全卷积判别器**。输出一个 2D 真假概率概率图，用于细粒度惩罚局部位置涂错色及结构不合理的异常。
+*   **代码及权重归档**：
+    *   **模型文件**：[generatorv2.py](file:///d:/data/project/PixelSprite_4Direction/pixel_sprite/model/GANv2/generatorv2.py) 与 [discriminatorv2.py](file:///d:/data/project/PixelSprite_4Direction/pixel_sprite/model/GANv2/discriminatorv2.py)
+    *   **权重目录**：`checkpoints/v2/`
+*   **启用方式**：在执行 `Train.py` 或 `train.py` 时添加可选参数 `-v 2`（默认即为 v2）。
+
+---
+
 ## 1. Goal
 
 先训练一个固定方向模型：

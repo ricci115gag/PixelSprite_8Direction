@@ -5,4 +5,14 @@ __all__ = ["PixelArtLoss", "train_model"]
 
 
 if __name__ == "__main__":
-    train_model()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train pixel sprite direction transfer GAN model.")
+    parser.add_argument(
+        "-v", "--version",
+        type=int,
+        default=2,
+        choices=[1, 2],
+        help="Model architecture version (1 or 2, default is 2)"
+    )
+    args = parser.parse_args()
+    train_model(version=args.version)

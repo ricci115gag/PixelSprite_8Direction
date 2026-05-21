@@ -24,3 +24,4 @@ train:
 # 其他参数
 misc:
   checkpoints_path: "./checkpoints"  # 模型保存路径
+  tb_port: 6006                      # TensorBoard 端口号，默认 6006。训练时会自动检测并在此端口开启 TensorBoard 服务

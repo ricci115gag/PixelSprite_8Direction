@@ -4,21 +4,27 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 from safetensors.torch import load_file
 from torchvision import transforms
 
 from pixel_sprite.config import load_config, resolve_project_path
-from pixel_sprite.model.generator import UNetGenerator
+from pixel_sprite.model.factory import get_model_class
 from pixel_sprite.model.image_ops import apply_palette_and_binarize
 
 
 DIRECTIONS = ("down", "left", "right", "up")
 
 
-def load_model(config: dict, device: torch.device, timestamp: str | None = None) -> UNetGenerator:
+def load_model(
+    config: dict, 
+    device: torch.device, 
+    timestamp: str | None = None, 
+    version: int = 2
+) -> nn.Module:
     checkpoints_path = config["misc"].get("checkpoints_path", "./checkpoints")
-    checkpoints_dir = resolve_project_path(checkpoints_path)
+    checkpoints_dir = resolve_project_path(checkpoints_path) / f"v{version}"
     
     if timestamp and timestamp != "latest":
         model_file = checkpoints_dir / f"generator_{timestamp}.safetensors"
@@ -28,7 +34,8 @@ def load_model(config: dict, device: torch.device, timestamp: str | None = None)
     if model_file is None or not model_file.exists():
         raise FileNotFoundError(f"Model file does not exist or checkpoints folder is empty: {model_file}")
         
-    model = UNetGenerator(**config["model"]).to(device)
+    GeneratorClass = get_model_class(version, "generator")
+    model = GeneratorClass(**config["model"]).to(device)
     state_dict = load_file(str(model_file), device=str(device))
     model.load_state_dict(state_dict)
     model.eval()
@@ -50,7 +57,7 @@ def predict_file(
     image_path: str | Path,
     source_direction: str,
     target_direction: str,
-    model: UNetGenerator,
+    model: nn.Module,
     device: torch.device,
 ) -> Path:
     image_path = Path(image_path)
@@ -68,7 +75,7 @@ def predict_file(
     return output_path
 
 
-def load_default_model() -> tuple[UNetGenerator, torch.device]:
+def load_default_model(version: int = 2) -> tuple[nn.Module, torch.device]:
     config = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return load_model(config, device), device
+    return load_model(config, device, version=version), device

@@ -72,5 +72,5 @@ class GlobalAttention(nn.Module):
         )
         attn = torch.matmul(q.transpose(-1, -2), k) * self.scale
         out = torch.matmul(F.softmax(attn, dim=-1), v.transpose(-1, -2))
-        out = out.permute(0, 1, 3, 4, 2).reshape(b, -1, h, w)
+        out = out.permute(0, 1, 3, 2).reshape(b, -1, h, w)
         return self.to_out(out)
